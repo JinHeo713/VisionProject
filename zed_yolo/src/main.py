@@ -19,7 +19,7 @@ import os
 import base64
 import cv2
 import uuid
-import APItest_v3
+import APItest_v5
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
@@ -44,7 +44,7 @@ async def read_root():
 # ───── 설정: 모델명 및 경로 ──────────────────────────────────────────
 @app.get("/vision/qc/check/wago")
 async def check_wago():
-    result = APItest_v3.check_device('WAGO750-1505')
+    result = APItest_v5.check_device('WAGO750-1505')
     if result["status"] == "failed":
         return result
 
@@ -58,12 +58,13 @@ async def check_wago():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result.get("f1_metrics", {})
     }
 
 @app.get("/vision/qc/check/bk20")
 async def check_bk20():
-    result = APItest_v3.check_device('BK20S-T2')
+    result = APItest_v5.check_device('BK20S-T2')
     if result["status"] == "failed":
         return result
 
@@ -76,12 +77,13 @@ async def check_bk20():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result.get("f1_metrics", {})
     }
 
 @app.get("/vision/qc/check/bs32")
 async def check_bs32():
-    result = APItest_v3.check_device('BS32c-6A')
+    result = APItest_v5.check_device('BS32c-6A')
     if result["status"] == "failed":
         return result
 
@@ -94,7 +96,8 @@ async def check_bs32():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result.get("f1_metrics", {})
     }
 
 # 이미지 반환
