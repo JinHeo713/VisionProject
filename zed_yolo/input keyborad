@@ -1,0 +1,28 @@
+if __name__ == "__main__":
+    shortcut_map = {
+        'wago':  'WAGO750-1505',
+        'bk20s': 'BK20S-T2',
+        'bs32c': 'BS32c-6A',
+    }
+
+    choice = input("실행할 모델을 입력하세요 (wago / bk20s / bs32c): ").strip().lower()
+    if choice not in shortcut_map:
+        print(f"잘못된 입력: '{choice}'. wago, bk20s, bs32c 중 하나를 입력하세요.")
+        exit(1)
+
+    model_name = shortcut_map[choice]
+    print(f">>> {model_name} 모델로 실행합니다...")
+
+    result = check_device(model_name)
+
+    print("\n===== 실행 결과 =====")
+    print(f"connect 탐지 횟수   : {result['status']['connect']}")
+    print(f"disconnect 탐지 횟수: {result['status']['disconnect']}")
+    print(f"F1 Score           : {result['f1_score']}")
+    print(f"CSV 경로           : {result['errata_csv']}")
+    print(f"이미지 파일        : images/{result['image_name']}")
+
+    cv2.imshow(f"{model_name} Detection", result['image'])
+    print("아무 키나 누르면 종료합니다...")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
