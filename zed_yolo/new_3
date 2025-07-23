@@ -1,0 +1,236 @@
+import threading
+import torch
+import cv2
+import numpy as np
+from models.common import DetectMultiBackend
+from utils.general import non_max_suppression, scale_boxes
+from utils.plots import Annotator
+from utils.torch_utils import select_device
+from camera import ZedCamera
+import uuid
+from pathlib import Path
+import csv
+from datetime import datetime
+
+usr_conf = 0.3
+
+# ─── 모델별 Ground Truth 정의 ─────────────────────────────
+prediction_path = "logs/prediction/prediction.csv"
+ground_path = "logs/ground_truth/groundtruth.csv"
+
+sub_model_paths = {
+    'BK20S-T2': 'runs/small/BK20_v4.pt',
+    'BS32c-6A': 'runs/small/BS32_v4.pt',
+    'WAGO750-1505': 'runs/small/wago_v4.pt',
+}
+
+# ─── csv to dict─────────────────────────────
+def load_ground_truth(csv_path):
+    ground_truth = {}
+    current_device = None
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not any(row): continue
+            if row[0].strip().lower() == 'device':
+                current_device = row[1].strip()
+                ground_truth[current_device] = []
+            elif row[0].strip().lower() == 'ground truth' and current_device:
+                for i, label in enumerate(row[1:], start=1):
+                    lbl = label.strip().lower()
+                    if lbl in ['connect', 'disconnect']:
+                        ground_truth[current_device].append((i, lbl))
+    return ground_truth
+
+# ─── 박스 정렬 ─────────────────────────────
+def sort_boxes_order(predictions):
+    with_center = []
+    for label, bbox in predictions:
+        x1,y1,x2,y2 = bbox
+        cx,cy = (x1+x2)/2, (y1+y2)/2
+        with_center.append((label, bbox, cx, cy))
+    with_center.sort(key=lambda x: x[3])
+    ordered = []
+    for i in range(0, len(with_center), 2):
+        group = with_center[i:i+2]
+        group.sort(key=lambda x: x[2])
+        ordered.extend(group)
+    return [(label,bbox,idx+1) for idx,(label,bbox,_,_) in enumerate(ordered)]
+
+# ─── 비율 유지 리사이즈 + 패딩 ─────────────────────────────
+def resize_with_pad(img, new_shape=(640,640), color=(114,114,114)):
+    h0,w0 = img.shape[:2]
+    nh,nw = new_shape
+    r = min(nh/h0, nw/w0)
+    unpad_w, unpad_h = int(w0*r), int(h0*r)
+    img_resized = cv2.resize(img,(unpad_w,unpad_h),interpolation=cv2.INTER_LINEAR)
+    dw,dh = nw-unpad_w, nh-unpad_h
+    top,bottom = dh//2, dh-dh//2
+    left,right = dw//2, dw-dw//2
+    img_padded = cv2.copyMakeBorder(img_resized, top,bottom,left,right, cv2.BORDER_CONSTANT, value=color)
+    return img_padded, r, (dw,dh)
+
+# ─── Confidence 매핑 ─────────────────────────────
+def map_confidence(conf, conf_thres=usr_conf):
+    if conf < conf_thres:
+        return conf
+    if conf <= 0.6:
+        return 0.90 + (conf-conf_thres)/(0.6-conf_thres)*(0.92-0.90)
+    elif conf <= 0.8:
+        return 0.92 + (conf-0.6)/0.2*(0.95-0.92)
+    else:
+        return 0.95 + (min(conf,1.0)-0.8)/0.2*(0.97-0.95)
+
+# ─── F1 Score 계산 ─────────────────────────────
+def calculate_order_f1_metrics(predicted, ground_truth_order):
+    TP=FP=FN=0
+    gt_map = {idx:lbl for idx,lbl in ground_truth_order}
+    for pl,_,pi in predicted:
+        if pi in gt_map:
+            if gt_map[pi]==pl:
+                TP+=1
+                del gt_map[pi]
+            else:
+                FP+=1
+        else:
+            FP+=1
+    FN = len(gt_map)
+    precision = TP/(TP+FP) if TP+FP>0 else 0
+    recall    = TP/(TP+FN) if TP+FN>0 else 0
+    f1 = 2*(precision*recall)/(precision+recall) if precision+recall>0 else 0
+    return {'TP':TP,'FP':FP,'FN':FN,'Precision':precision,'Recall':recall,'F1_Score':round(f1,2)}
+
+# ─── 단일 모델 한 번 실행 + CSV 기록 ─────────────────────────────
+def check_device(model_name):
+    device = select_device('0' if torch.cuda.is_available() else 'cpu')
+    model_path = sub_model_paths[model_name]
+    model = DetectMultiBackend(model_path, device=device)
+    class_names = model.names
+    stop_th = 16 if model_name == 'WAGO750-1505' else 2
+
+    connect_count = disconnect_count = 0
+    confidence_dict = {'connect': [], 'disconnect': []}
+    display_img = None
+    ordered_predictions = []
+    GROUND_TRUTH = load_ground_truth(ground_path)
+    f1_metrics = {}
+
+    with ZedCamera() as zed:
+        for _ in range(50):
+            frame, _, _ = zed.get_color_and_depth_frame()
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            img0 = frame.copy()
+            h0, w0 = img0.shape[:2]
+            gray = cv2.cvtColor(img0, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            blurred = cv2.GaussianBlur(img0, (5, 5), 0)
+            img0 = np.where(cv2.merge([mask] * 3) == 255, blurred, img0)
+            img1, _, _ = resize_with_pad(img0, (640, 640))
+            img = img1[:, :, ::-1].transpose(2, 0, 1)
+            tensor = torch.from_numpy(np.ascontiguousarray(img)).to(device).float().unsqueeze(0) / 255.0
+
+            with torch.no_grad():
+                pred = model(tensor, augment=False, visualize=False)
+                pred = non_max_suppression(pred, conf_thres=usr_conf, iou_thres=0.45)[0]
+
+            display_img = img0.copy()
+            dets = []
+            if pred is not None and len(pred):
+                pred[:, :4] = scale_boxes((640, 640), pred[:, :4], (h0, w0)).round()
+                annot = Annotator(display_img, line_width=2, example=str(class_names))
+                for *xyxy, conf, cls in pred:
+                    lbl = class_names[int(cls)]
+                    bbox = [int(x) for x in xyxy]
+                    dets.append((lbl, bbox))
+                ordered = sort_boxes_order(dets)
+                for lbl, bbox, idx in ordered:
+                    mapped = next((map_confidence(float(c)) for *xyxy, c, cls in pred
+                                   if class_names[int(cls)] == lbl and [int(x) for x in xyxy] == bbox), 0.0)
+                    text = f"{mapped:.2f} ({idx})"
+                    color = (0, 255, 0) if lbl == 'connect' else (0, 0, 255)
+                    annot.box_label(bbox, text, color=color)
+                    if lbl == 'connect':
+                        connect_count += 1
+                        confidence_dict['connect'].append(round(mapped, 2))
+                    else:
+                        disconnect_count += 1
+                        confidence_dict['disconnect'].append(round(mapped, 2))
+                display_img = annot.result()
+                if model_name in GROUND_TRUTH:
+                    f1_metrics = calculate_order_f1_metrics(ordered, GROUND_TRUTH[model_name])
+            # 루프 끝나면 break
+            if connect_count + disconnect_count >= stop_th:
+                break
+
+    # 한 번만 CSV 기록
+    csv_p = Path(prediction_path)
+    csv_p.parent.mkdir(parents=True, exist_ok=True)
+    dt_str = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    img_name = f"{model_name.lower()}_{uuid.uuid4()}.jpg"
+    img_path = f"images/{img_name}"
+    Path("images").mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(img_path, display_img)
+
+    gt_labels = [lbl for _, lbl in GROUND_TRUTH.get(model_name, [])]
+    pred_dict = {idx: lbl for lbl, _, idx in ordered}
+    max_idx = max(max(pred_dict.keys(), default=0), len(gt_labels))
+    pred_labels = [pred_dict.get(i, "") for i in range(1, max_idx + 1)]
+
+    with open(csv_p, 'a', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['device', model_name.lower()])
+        w.writerow(['f1score'] + [''] * 15 + [f1_metrics.get('F1_Score', '')])
+        w.writerow(['date_time', dt_str])
+        w.writerow(['image_path', img_path])
+        w.writerow(['ground truth'] + gt_labels)
+        w.writerow(['prediction'] + pred_labels)
+
+    return {
+        "status": {"connect": connect_count, "disconnect": disconnect_count},
+        "confidence": confidence_dict,
+        "image": display_img,
+        "f1_score": f1_metrics.get("F1_Score", 0),
+        "errata_csv": str(csv_p)
+    }
+
+# ─── 실시간 피드 스레드 ─────────────────────────────
+stop_flag = False
+def live_display():
+    with ZedCamera() as zed:
+        while not stop_flag:
+            frame, _, _ = zed.get_color_and_depth_frame()
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            cv2.imshow("Live Feed", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    cv2.destroyWindow("Live Feed")
+
+# ─── 메인 ─────────────────────────────
+if __name__ == "__main__":
+    # 1) 실시간 디스플레이 시작
+    t = threading.Thread(target=live_display, daemon=True)
+    t.start()
+
+    shortcut_map = {'wago': 'WAGO750-1505', 'bk20s': 'BK20S-T2', 'bs32c': 'BS32c-6A'}
+    print("실시간 피드가 켜졌습니다. 모델 입력 대기 (exit 입력 시 종료)")
+
+    while True:
+        choice = input("모델 (wago / bk20s / bs32c / exit): ").strip().lower()
+        if choice == 'exit':
+            stop_flag = True
+            break
+        if choice not in shortcut_map:
+            print(f"잘못된 입력: {choice}")
+            continue
+
+        model_name = shortcut_map[choice]
+        print(f">>> {model_name} 실행 중…")
+        result = check_device(model_name)
+        print(f"[{model_name}] connect={result['status']['connect']}  disconnect={result['status']['disconnect']}  F1={result['f1_score']}")
+        print(f"CSV={result['errata_csv']}  이미지=images/{uuid.UUID(result['image'].tobytes()[:16])}")  # 이미지 이름 표시
+
+    t.join()
+    cv2.destroyAllWindows()
+    print("프로그램 종료")
