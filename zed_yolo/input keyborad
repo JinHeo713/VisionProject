@@ -26,3 +26,71 @@ if __name__ == "__main__":
     print("아무 키나 누르면 종료합니다...")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+---------------------------------------------------------------------------------------------------------
+
+import threading
+
+# 실시간 피드 제어 플래그
+stop_flag = False
+
+def live_display():
+    """ZedCamera로부터 프레임을 받아 실시간으로 띄워줍니다."""
+    with ZedCamera() as zed:
+        while not stop_flag:
+            frame, _, _ = zed.get_color_and_depth_frame()
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            cv2.imshow("Live Feed", frame)
+            # 'q' 누르면 실시간 창만 닫고 루프 빠져나갑니다.
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    cv2.destroyWindow("Live Feed")
+
+
+
+if __name__ == "__main__":
+    # 1) 실시간 디스플레이 스레드 시작
+    t = threading.Thread(target=live_display, daemon=True)
+    t.start()
+
+    # 2) 입력 ↔ 모델명 매핑
+    shortcut_map = {
+        'wago':  'WAGO750-1505',
+        'bk20s': 'BK20S-T2',
+        'bs32c': 'BS32c-6A',
+    }
+
+    print("실시간 피드가 켜졌습니다. 모델 키워드를 입력하세요.")
+    print("종료하려면 'exit' 입력 또는 실시간 창에서 'q' 누르기")
+
+    while True:
+        choice = input("모델 (wago / bk20s / bs32c / exit): ").strip().lower()
+
+        if choice == 'exit':
+            stop_flag = True
+            break
+
+        if choice not in shortcut_map:
+            print(f"잘못된 입력: '{choice}'. 다시 입력하세요.")
+            continue
+
+        model_name = shortcut_map[choice]
+        print(f">>> {model_name} 모델 실행 중...")
+
+        # 한 번 실행하고 CSV 기록
+        result = check_device(model_name)
+
+        # 실행 결과 요약
+        print(f"[{model_name}] connect: {result['status']['connect']}  disconnect: {result['status']['disconnect']}  F1: {result['f1_score']}")
+        print(f"CSV: {result['errata_csv']}  이미지: images/{result['image_name']}")
+
+        # 스냅샷 보기
+        cv2.imshow(f"{model_name} Snapshot", result['image'])
+        cv2.waitKey(1)  # 창만 띄우고 바로 리턴
+        cv2.destroyWindow(f"{model_name} Snapshot")
+
+    # 3) 깔끔히 종료
+    t.join()
+    cv2.destroyAllWindows()
+    print("프로그램을 종료합니다.")
