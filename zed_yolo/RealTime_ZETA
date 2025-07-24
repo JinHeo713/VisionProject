@@ -202,3 +202,123 @@ if __name__ == '__main__':
                 break
 
     cv2.destroyAllWindows()
+
+
+####################################################################################################
+# Device.pt 기기 분류 모델 포함 #
+import cv2
+import torch
+import numpy as np
+from pathlib import Path
+from models.common import DetectMultiBackend
+from utils.general import non_max_suppression, scale_boxes
+from utils.plots import Annotator
+from utils.torch_utils import select_device
+from camera import ZedCamera
+
+# -------------------------------------------------------------------
+# 1) 모델 로드
+# -------------------------------------------------------------------
+device = select_device('0' if torch.cuda.is_available() else 'cpu')
+
+# 1차: Device 종류 검출용 YOLO 모델
+device_detect = DetectMultiBackend("runs/small/Device.pt", device=device)
+device_names  = device_detect.names
+
+# 2차: 각 기기별 connect/disconnect 전용 YOLO 모델
+special_paths = {
+    'WAGO750-1505': 'runs/small/wago_v4.pt',
+    'BK20S-T2':     'runs/small/BK20_v4.pt',
+    'BS32c-6A':     'runs/small/BS32_v4.pt',
+}
+special_models = {
+    name: DetectMultiBackend(path, device=device)
+    for name, path in special_paths.items()
+}
+
+# -------------------------------------------------------------------
+# 2) 유틸 함수
+# -------------------------------------------------------------------
+def resize_with_pad(img, new_shape=(640, 640), color=(114,114,114)):
+    h0,w0 = img.shape[:2]
+    r = min(new_shape[0]/h0, new_shape[1]/w0)
+    unpad_w, unpad_h = int(w0*r), int(h0*r)
+    img_r = cv2.resize(img, (unpad_w, unpad_h))
+    dw, dh = new_shape[1]-unpad_w, new_shape[0]-unpad_h
+    top, bottom = dh//2, dh-dh//2
+    left, right = dw//2, dw-dw//2
+    return cv2.copyMakeBorder(img_r, top, bottom, left, right,
+                              cv2.BORDER_CONSTANT, value=color)
+
+def detect_devices(frame, model, conf_thres=0.3, iou_thres=0.45):
+    """Device.pt 모델로 1차 검출 → [(label, (x1,y1,x2,y2)), …] 반환"""
+    img = resize_with_pad(frame)[:, :, ::-1].transpose(2,0,1)
+    tensor = torch.from_numpy(np.ascontiguousarray(img)) \
+                  .to(model.device).float().unsqueeze(0)/255.0
+    with torch.no_grad():
+        pred = model(tensor, augment=False, visualize=False)
+        pred = non_max_suppression(pred, conf_thres, iou_thres)[0]
+    dets = []
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_boxes((640,640), pred[:, :4], frame.shape[:2]).round()
+        for *xyxy, conf, cls in pred:
+            x1,y1,x2,y2 = map(int, xyxy)
+            lbl = model.names[int(cls)]
+            dets.append((lbl, (x1,y1,x2,y2)))
+    return dets
+
+def predict_model_on_crop(crop, model):
+    """crop 영역에 대해 기존 predict_model() 호출(어노테이션된 crop 리턴)"""
+    from utils.general    import non_max_suppression, scale_boxes
+    from utils.plots      import Annotator
+    # (predict_model 내부 구현 그대로 재사용)
+    img_pad = resize_with_pad(crop)
+    img     = img_pad[:,:,::-1].transpose(2,0,1)
+    tensor  = torch.from_numpy(np.ascontiguousarray(img)) \
+                     .to(model.device).float().unsqueeze(0)/255.0
+    with torch.no_grad():
+        pred = model(tensor, augment=False, visualize=False)
+        pred = non_max_suppression(pred, conf_thres=0.3, iou_thres=0.45)[0]
+    annotated = crop.copy()
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_boxes((640,640), pred[:, :4], crop.shape[:2]).round()
+        ann = Annotator(annotated, line_width=2, example=str(model.names))
+        for *xyxy, conf, cls in pred:
+            x1,y1,x2,y2 = [int(x.item()) for x in xyxy]
+            label = model.names[int(cls)]
+            ann.box_label([x1,y1,x2,y2], f"{label} {conf:.2f}")
+        annotated = ann.result()
+    return annotated
+
+# -------------------------------------------------------------------
+# 3) 메인 루프
+# -------------------------------------------------------------------
+with ZedCamera() as zed:
+    while True:
+        frame, _, _ = zed.get_color_and_depth_frame()
+        if frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        annotated = frame.copy()
+
+        # ── 1차: Device.pt로 모델 종류 검출
+        devs = detect_devices(frame, device_detect)
+        for dev_label, (x1,y1,x2,y2) in devs:
+            # 1차 BB 그리기
+            cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,255,255), 2)
+            cv2.putText(annotated, dev_label, (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+            # ── 2차: 전용 모델이 있으면 ROI에 predict
+            if dev_label in special_models:
+                crop = frame[y1:y2, x1:x2]
+                ann_crop = predict_model_on_crop(crop, special_models[dev_label])
+                # 결과를 원본 위치에 덮어쓰기
+                annotated[y1:y2, x1:x2] = ann_crop
+
+        cv2.imshow("Two-Stage Device + CC Detection", annotated)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+cv2.destroyAllWindows()
+
