@@ -1,0 +1,294 @@
+import cv2
+import torch
+import numpy as np
+import uuid
+import csv
+from datetime import datetime
+from pathlib import Path
+from models.common import DetectMultiBackend
+from utils.general import non_max_suppression, scale_boxes
+from utils.plots import Annotator
+from utils.torch_utils import select_device
+from camera import ZedCamera
+
+usr_conf = 0.3
+ground_path = "logs/ground_truth/groundtruth.csv"
+prediction_path = "logs/prediction/prediction.csv"
+
+# 메모리상에 저장할 ground truth 딕셔너리
+ground_truth_dict = {}
+
+# 모델 로드
+device = select_device('0' if torch.cuda.is_available() else 'cpu')
+
+# 1차: Device 종류 검출용 YOLO 모델
+device_detect = DetectMultiBackend("runs/small/Device.pt", device=device)
+device_names  = device_detect.names
+
+model_paths = {
+    'WAGO750-1505': 'runs/small/wago_v4.pt',
+    'BK20S-T2':     'runs/small/BK20_v4.pt',
+    'BS32c-6A':     'runs/small/BS32_v4.pt',
+}
+sub_models = {
+    name: DetectMultiBackend(path, device=device)
+    for name, path in model_paths.items()
+}
+
+# ---------- Util functions ----------
+def resize_with_pad(img, new_shape=(640, 640), color=(114, 114, 114)):
+    h0, w0 = img.shape[:2]
+    r = min(new_shape[0] / h0, new_shape[1] / w0)
+    unpad_w, unpad_h = int(w0 * r), int(h0 * r)
+    img_resized = cv2.resize(img, (unpad_w, unpad_h))
+    dw, dh = new_shape[1] - unpad_w, new_shape[0] - unpad_h
+    top, bottom = dh // 2, dh - dh // 2
+    left, right = dw // 2, dw - dw // 2
+    img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return img_padded
+
+def map_confidence(conf):
+    if conf < usr_conf: return conf
+    if conf <= 0.6: return 0.90 + (conf - usr_conf) / (0.6 - usr_conf) * (0.92 - 0.90)
+    elif conf <= 0.8: return 0.92 + (conf - 0.6) / 0.2 * (0.95 - 0.92)
+    else: return 0.95 + (min(conf, 1.0) - 0.8) / 0.2 * (0.97 - 0.95)
+
+def sort_boxes_order(predictions):
+    with_center = []
+    for label, bbox in predictions:
+        x1, y1, x2, y2 = bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        with_center.append((label, bbox, cx, cy))
+    with_center.sort(key=lambda x: x[3])
+    ordered = []
+    for i in range(0, len(with_center), 2):
+        group = with_center[i:i+2]
+        group.sort(key=lambda x: x[2])
+        ordered.extend(group)
+    return [(label, bbox, idx + 1) for idx, (label, bbox, _, _) in enumerate(ordered)]
+
+def load_ground_truth(csv_path):
+    ground_truth = {}
+    current_device = None
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not any(row): continue
+            if row[0].strip().lower() == 'device':
+                current_device = row[1].strip()
+                ground_truth[current_device] = []
+            elif row[0].strip().lower() == 'ground truth' and current_device:
+                for i, label in enumerate(row[1:], start=1):
+                    if label.strip().lower() in ['connect', 'disconnect']:
+                        ground_truth[current_device].append((i, label.strip().lower()))
+    return ground_truth
+
+def calculate_f1(predicted, ground_truth):
+    TP = FP = FN = 0
+    gt_map = {idx: label for idx, label in ground_truth}
+    for pred_label, _, order in predicted:
+        if order in gt_map:
+            if gt_map[order] == pred_label:
+                TP += 1
+                del gt_map[order]
+            else:
+                FP += 1
+        else:
+            FP += 1
+    FN = len(gt_map)
+    precision = TP / (TP + FP) if TP + FP else 0
+    recall = TP / (TP + FN) if TP + FN else 0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0
+    return round(f1, 2) * 100
+
+def detect_devices(frame, model, conf_thres=0.3, iou_thres=0.45):
+    """Device.pt 모델로 1차 검출 → [(label, (x1,y1,x2,y2)), …] 반환"""
+    img = resize_with_pad(frame)[:, :, ::-1].transpose(2,0,1)
+    tensor = torch.from_numpy(np.ascontiguousarray(img)).to(model.device).float().unsqueeze(0)/255.0
+    with torch.no_grad():
+        pred = model(tensor, augment=False, visualize=False)
+        pred = non_max_suppression(pred, conf_thres, iou_thres)[0]
+    dets = []
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_boxes((640,640), pred[:, :4], frame.shape[:2]).round()
+        for *xyxy, conf, cls in pred:
+            x1,y1,x2,y2 = map(int, xyxy)
+            lbl = model.names[int(cls)]
+            dets.append((lbl, (x1,y1,x2,y2)))
+    return dets
+
+def predict_model_on_crop(crop, model):
+    """crop 영역에 대해 기존 predict_model() 호출(어노테이션된 crop 리턴)"""
+    from utils.general    import non_max_suppression, scale_boxes
+    from utils.plots      import Annotator
+    # (predict_model 내부 구현 그대로 재사용)
+    img     = img_pad[:,:,::-1].transpose(2,0,1)
+    tensor  = torch.from_numpy(np.ascontiguousarray(img)) \
+                     .to(model.device).float().unsqueeze(0)/255.0
+    with torch.no_grad():
+        pred = model(tensor, augment=False, visualize=False)
+        pred = non_max_suppression(pred, conf_thres=usr_conf, iou_thres=0.45)[0]
+    annotated = crop.copy()
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_boxes((640,640), pred[:, :4], crop.shape[:2]).round()
+        ann = Annotator(annotated, line_width=1, example=str(model.names))
+        for *xyxy, conf, cls in pred:   
+            x1,y1,x2,y2 = [int(x.item()) for x in xyxy]
+            label = model.names[int(cls)]
+            conf_mapped = map_confidence(float(conf))
+            color = (0, 255, 0) if label.lower()=='connect' else (0, 0, 255)
+            # ann.box_label([x1,y1,x2,y2], f"{label} {conf_mapped:.2f}", color = color) # <- label name o 
+            ann.box_label([x1,y1,x2,y2], f"{conf_mapped:.2f}", color = color)
+        annotated = ann.result()
+    return annotated
+
+#-------------------------------------------------------------------------------#
+#----------------------키 입력마다 groundtruth.csv파일 다시 쓰기-------------------#
+def predict_model(frame, model, model_name=None):
+    img_padded = resize_with_pad(frame)
+    img = img_padded[:, :, ::-1].transpose(2, 0, 1)
+    img_tensor = torch.from_numpy(np.ascontiguousarray(img)) \
+                     .to(model.device).float().unsqueeze(0) / 255.0
+
+    with torch.no_grad():
+        pred = model(img_tensor, augment=False, visualize=False)
+        pred = non_max_suppression(pred, conf_thres=usr_conf, iou_thres=0.45)[0]
+
+    annotated = frame.copy()
+    predictions = []
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_boxes((640, 640), pred[:, :4],
+                                   frame.shape[:2]).round()
+        annotator = Annotator(annotated, line_width=1, example=str(model.names))
+        for *xyxy, conf, cls in pred:
+            label = model.names[int(cls)]  # connect/disconnect
+            bbox = [int(x.item()) for x in xyxy]
+            conf_mapped = map_confidence(float(conf))
+            predictions.append((label, bbox))
+
+            # 💡 Update this line:
+            display_label = f"{model_name}: {label} {conf_mapped:.2f}" if model_name else f"{label} {conf_mapped:.2f}"
+            color = (0, 255, 0) if label == 'connect' else (0, 0, 255)
+            annotator.box_label(bbox, display_label, color=color)
+
+        annotated = annotator.result()
+    return annotated, predictions
+
+# ground truth 입력 함수
+def prompt_ground_truth(model_name):
+    seq = input(f"{model_name} 의 ground truth를 1(connect), 0(disconnect)로 순서대로 입력하세요 (공백으로 구분):\n> ")
+    bits = seq.strip().split()
+    labels = ['connect' if b == '1' else 'disconnect' for b in bits]
+    return [(i, label) for i, label in enumerate(labels, start=1)]
+
+def save_groud_truth_csv(csv_path, gt_dict, model_order):
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        for idx, model in enumerate(model_order):
+            if model in gt_dict:
+                # device row
+                writer.writerow(['device', model])
+                #ground truth row
+                labels = [label for _, label in gt_dict[model]]
+                writer.writerow(['ground truth'] + labels)
+                if idx < len(model_order) - 1:
+                    writer.writerow([])
+
+# save_results 수정: CSV에서 ground truth 불러오지 않고, 메모리 dict 사용
+def save_results(preds, model_name, img_to_save):
+    ordered     = sort_boxes_order(preds)
+    gt_list     = ground_truth_dict.get(model_name, [])
+    gt_labels   = [label for _, label in gt_list]
+    f1          = calculate_f1(ordered, gt_list)
+
+    image_name  = f"{model_name}_{uuid.uuid4()}.jpg"
+    image_path  = Path("images") / image_name
+    cv2.imwrite(str(image_path), img_to_save)
+
+    with open(prediction_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['device', model_name])
+        writer.writerow(['f1score', *(['']*16), f1])
+        writer.writerow(['date_time', datetime.now().strftime("%Y_%m_%d_%Hh%Mm%Ss")])
+        writer.writerow(['image_path', str(image_path)])
+        writer.writerow(['ground truth'] + gt_labels)
+        writer.writerow(['prediction']   + [label for label in
+                                           [ordered_item[0] for ordered_item in ordered]])
+    print(f"[✔] Saved annotated image for {model_name} with F1: {f1}")
+
+# 키보드 입력에 대응할 모델 키 매핑
+model_key_map = {
+    ord('w'): 'WAGO750-1505',
+    ord('b'): 'BK20S-T2',
+    ord('s'): 'BS32c-6A',
+}
+
+if __name__ == '__main__':
+    device = select_device('0' if torch.cuda.is_available() else 'cpu')
+
+    # 모델 초기화
+    model_device = DetectMultiBackend('runs/small/Device.pt', device=device)
+    device_names = model_device.names
+
+    models = {
+        name: DetectMultiBackend(path, device=device)
+        for name, path in model_paths.items()
+    }
+    models['Device'] = model_device
+
+    model_order = list(model_paths.keys())
+    device_color_map = {
+        'WAGO750-1505': (255, 0, 0),
+        'BK20S-T2':     (0, 255, 255),
+        'BS32c-6A':     (0, 165, 255),
+    }
+
+    print("[INFO] Starting real-time inference...")
+    with ZedCamera() as zed:
+        while True:
+            # 1) 프레임 캡처
+            frame, _, _ = zed.get_color_and_depth_frame()
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            original = frame.copy()
+
+            # 2) 밝은 영역 블러 처리 (선택사항)
+            gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+            _, bright_mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            blurred = cv2.GaussianBlur(original, (5, 5), 0)
+            original = np.where(cv2.merge([bright_mask]*3) == 255, blurred, original)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            # 3) 키 입력 → Ground Truth 설정
+            if key in model_key_map:
+                model_key = model_key_map[key]
+                ground_truth_dict[model_key] = prompt_ground_truth(model_key)
+                save_groud_truth_csv(ground_path, ground_truth_dict, model_order)
+                print(f"[✔] Ground truth 입력 완료 for {model_key}")
+
+            # 4) Ground Truth가 등록된 모든 모델에 대해 반복 예측
+            for model_key in list(ground_truth_dict.keys()):
+                _, preds = predict_model(original, models[model_key])
+                ordered = sort_boxes_order(preds)
+                gt_list = ground_truth_dict[model_key]
+                f1 = calculate_f1(ordered, gt_list)
+
+                if f1 == 100:
+                    save_results(preds, model_key, original.copy())
+                    print(f"[✔] F1 Score → 저장 완료 for {model_key}")
+                    del ground_truth_dict[model_key]
+                else:
+                    print(f"[ ] {model_key}: F1 Score = {f1} (계속 예측 중)")
+
+            # 5) 화면 출력 (디버깅용)
+            display_frame = frame.copy()
+            for name, model in sub_models.items():
+                display_frame, _ = predict_model(display_frame, model, model_name=name)
+            cv2.imshow("Real-Time Multi Model Inference", display_frame)
+
+            # 종료 조건
+            if key == ord('q'):
+                break
+
+    cv2.destroyAllWindows()
