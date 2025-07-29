@@ -19,6 +19,7 @@ import os
 import base64
 import cv2
 import uuid
+import APItest_v4
 import APItest_v3
 
 import sys
@@ -58,7 +59,8 @@ async def check_wago():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result["f1_score"]
     }
 
 @app.get("/vision/qc/check/bk20")
@@ -76,7 +78,8 @@ async def check_bk20():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result["f1_score"]
     }
 
 @app.get("/vision/qc/check/bs32")
@@ -94,7 +97,8 @@ async def check_bs32():
     return {
         "status": result["status"],
         "confidence": result["confidence"],
-        "image_name": result["image_name"]
+        "image_name": result["image_name"],
+        "f1_metrics": result["f1_score"]
     }
 
 # 이미지 반환

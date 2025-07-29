@@ -171,7 +171,7 @@ with ZedCamera() as zed:
                                 continue
                             cls2_name = sub_names[int(cls2)]
                             mapped_conf2 = map_confidence(float(conf2), conf_thres=usr_thr)
-                            label2 = f"{cls2_name} {mapped_conf2:.2f}"
+                            label2 = f"{mapped_conf2:.2f}"
                             color2 = (0,255,0) if cls2_name=='connect' else (0,0,255)
                             annotator.box_label(xyxy2, label2, color=color2)
 
